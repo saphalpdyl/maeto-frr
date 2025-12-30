@@ -5838,8 +5838,7 @@ IS-IS L1 IPv6 routing table:
  fc00:0:4::/48    31      -          rt3      -              
  fc00:0:6::/48    41      -          rt3      implicit-null  
 
-test#  
-
+test# 
 test# test isis topology 1 root rt1 leak level-1-only
 Prefixes of the level-1 IPv4 SPT that are leaked into level-2:
  10.0.255.2/32  20
