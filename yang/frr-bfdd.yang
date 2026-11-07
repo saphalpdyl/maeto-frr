@@ -52,6 +52,12 @@ module frr-bfdd {
      (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
      OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.";
 
+  revision 2026-11-07 {
+    description "Add notifications";
+    reference
+      "RFC 9314: YANG Data Model for Bidirectional Forwarding Detection (BFD)";
+  }
+
   revision 2025-03-03 {
     description "Add log-session-changes leaf";
     reference
@@ -720,5 +726,77 @@ module frr-bfdd {
       description
         "This container defines BFD protocol configuration.";
     }
+  }
+
+  /* Notifications [RFC 9314] */
+  grouping notification-parms {
+    description
+      "This group describes common parameters that will be sent
+      as part of BFD notifications.";
+    leaf local-discr {
+      type discriminator;
+      description
+        "BFD local discriminator.";
+    }
+    leaf remote-discr {
+      type discriminator;
+      description
+        "BFD remote discriminator.";
+    }
+    leaf new-state {
+      type state;
+      description
+        "Current BFD state.";
+    }
+    leaf state-change-reason {
+      type diagnostic;
+      description
+        "Reason for the BFD state change.";
+    }
+    leaf time-of-last-state-change {
+      type yang:date-and-time;
+      description
+        "Calendar time of the most recent previous state change.";
+    }
+    leaf dest-addr {
+      type inet:ip-address;
+      description
+        "BFD peer address.";
+    }
+    leaf source-addr {
+      type inet:ip-address;
+      description
+        "BFD local address.";
+    }
+    leaf vrf {
+      type frr-vrf:vrf-ref;
+      description "Virtual Routing Domain name";
+    }
+  }
+
+  notification singlehop-notification {
+    description
+      "Notification for BFD single-hop session state change.  An
+      implementation may rate-limit notifications, e.g., when a
+      session is continuously changing state.";
+    uses notification-parms;
+    leaf interface {
+      type frr-interface:interface-ref;
+      description
+        "Interface to which this BFD session belongs.";
+    }
+    leaf echo-enabled {
+      type boolean;
+      description
+        "Indicates whether Echo was enabled for BFD.";
+    }
+  }
+
+  notification multihop-notification {
+    description
+      "Notification for BFD multihop session state change.  An
+      implementation may rate-limit notifications, e.g., when a
+      session is continuously changing state.";
+    uses notification-parms;
   }
 }
