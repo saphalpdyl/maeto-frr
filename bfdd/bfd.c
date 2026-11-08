@@ -19,6 +19,7 @@
 
 #include "bfd.h"
 #include "bfd_trace.h"
+#include "bfdd_nb.h"
 
 DEFINE_MTYPE_STATIC(BFDD, BFDD_CONFIG, "long-lived configuration memory");
 DEFINE_MTYPE_STATIC(BFDD, BFDD_PROFILE, "long-lived profile memory");
@@ -796,6 +797,8 @@ void ptm_bfd_sess_up(struct bfd_session *bfd)
 
 	ptm_bfd_notify(bfd, bfd->ses_state);
 
+	bfd_notif_session_state_change(bfd, old_state);
+
 	frrtrace(4, frr_bfd, state_change, bfd, old_state, bfd->ses_state, bfd->local_diag);
 
 	if (old_state != bfd->ses_state) {
@@ -856,6 +859,8 @@ void ptm_bfd_sess_dn(struct bfd_session *bfd, uint8_t diag, bool notify_admin_do
 		else
 			ptm_bfd_notify(bfd, PTM_BFD_DOWN);
 	}
+
+	bfd_notif_session_state_change(bfd, old_state);
 
 	/* Stop echo packet transmission if they are active */
 	if (CHECK_FLAG(bfd->flags, BFD_SESS_FLAG_ECHO_ACTIVE))
@@ -1464,6 +1469,9 @@ static void bs_down_handler(struct bfd_session *bs, int nstate)
 		break;
 
 	case PTM_BFD_DOWN:
+		/* Capture old state for notification*/
+		int old_state = bs->ses_state;
+
 		/*
 		 * Remote peer agreed that the path is down, lets try to
 		 * bring it up.
@@ -1481,6 +1489,8 @@ static void bs_down_handler(struct bfd_session *bs, int nstate)
 		 */
 		if (CHECK_FLAG(bs->flags, BFD_SESS_FLAG_PASSIVE))
 			ptm_bfd_xmt_TO(bs, 0);
+
+		bfd_notif_session_state_change(bs, old_state);
 
 		break;
 
@@ -1852,6 +1862,8 @@ void bfd_set_shutdown(struct bfd_session *bs, bool shutdown)
 	else
 		is_shutdown = CHECK_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN);
 
+	int old_state = bs->ses_state;
+
 	if (shutdown) {
 		/* Already shutdown. */
 		if (is_shutdown)
@@ -1865,6 +1877,7 @@ void bfd_set_shutdown(struct bfd_session *bs, bool shutdown)
 			bs->ses_state = PTM_BFD_ADM_DOWN;
 			bfd_dplane_update_session(bs);
 			ptm_bfd_notify(bs, bs->ses_state);
+			bfd_notif_session_state_change(bs, old_state);
 			return;
 		}
 
@@ -1877,6 +1890,7 @@ void bfd_set_shutdown(struct bfd_session *bs, bool shutdown)
 		/* Change and notify state change. */
 		bs->ses_state = PTM_BFD_ADM_DOWN;
 		ptm_bfd_notify(bs, bs->ses_state);
+		bfd_notif_session_state_change(bs, old_state);
 
 		/* Don't try to send packets with a disabled session. */
 		if (bs->sock != -1)
@@ -1893,12 +1907,14 @@ void bfd_set_shutdown(struct bfd_session *bs, bool shutdown)
 			bs->ses_state = PTM_BFD_DOWN;
 			bfd_dplane_update_session(bs);
 			ptm_bfd_notify(bs, bs->ses_state);
+			bfd_notif_session_state_change(bs, old_state);
 			return;
 		}
 
 		/* Change and notify state change. */
 		bs->ses_state = PTM_BFD_DOWN;
 		ptm_bfd_notify(bs, bs->ses_state);
+		bfd_notif_session_state_change(bs, old_state);
 
 		/* Enable timers if non passive, otherwise stop them. */
 		if (CHECK_FLAG(bs->flags, BFD_SESS_FLAG_PASSIVE)) {

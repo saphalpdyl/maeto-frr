@@ -33,6 +33,7 @@
 #include "bfd.h"
 #include "bfddp_packet.h"
 #include "bfd_trace.h"
+#include "bfdd_nb.h"
 
 #include "lib/openbsd-queue.h"
 
@@ -435,6 +436,9 @@ bfd_dplane_session_state_change(struct bfd_dplane_ctx *bdc,
 	/* No state change. */
 	if (old_state == bs->ses_state)
 		return;
+
+	/* Send notification to Northbound */
+	bfd_notif_session_state_change(bs, old_state);
 
 	switch (bs->ses_state) {
 	case PTM_BFD_ADM_DOWN:

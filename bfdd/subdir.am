@@ -21,6 +21,7 @@ bfdd_libbfd_a_SOURCES = \
 	bfdd/event.c \
 	bfdd/ptm_adapter.c \
 	bfdd/bfd_trace.c \
+	bfdd/bfdd_nb_notifications.c \
 	# end
 
 # Install headers so it can be used by external data plane

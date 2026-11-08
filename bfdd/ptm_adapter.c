@@ -16,6 +16,7 @@
 
 #include "bfd.h"
 #include "bfd_trace.h"
+#include "bfdd_nb.h"
 
 /*
  * Data structures
@@ -135,9 +136,13 @@ static void _ptm_bfd_session_del(struct bfd_session *bs, uint8_t diag)
 	frrtrace(7, frr_bfd, ptm_session_event, 2, bs->discrs.my_discr, diag, bs->key.family,
 		 (uint8_t *)&bs->key.local, (uint8_t *)&bs->key.peer, bs->refcount);
 
+	int old_state = bs->ses_state;
+
 	/* Change state and notify peer. */
 	bs->ses_state = PTM_BFD_DOWN;
 	bs->local_diag = diag;
+
+	bfd_notif_session_state_change(bs, old_state);
 
 	if (bs->bfd_mode == BFD_MODE_TYPE_BFD)
 		ptm_bfd_snd(bs, 0);
