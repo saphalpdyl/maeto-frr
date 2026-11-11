@@ -1458,6 +1458,9 @@ static void bs_admin_down_handler(struct bfd_session *bs
 
 static void bs_down_handler(struct bfd_session *bs, int nstate)
 {
+	/* Capture old state for notification*/
+	int old_state = bs->ses_state;
+
 	switch (nstate) {
 	case PTM_BFD_ADM_DOWN:
 		/*
@@ -1469,8 +1472,6 @@ static void bs_down_handler(struct bfd_session *bs, int nstate)
 		break;
 
 	case PTM_BFD_DOWN:
-		/* Capture old state for notification*/
-		int old_state = bs->ses_state;
 
 		/*
 		 * Remote peer agreed that the path is down, lets try to
