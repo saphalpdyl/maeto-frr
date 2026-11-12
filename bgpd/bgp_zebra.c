@@ -2708,7 +2708,7 @@ int bgp_zebra_advertise_subnet(struct bgp *bgp, int advertise, vni_t vni)
 
 	zclient_create_header(s, ZEBRA_ADVERTISE_SUBNET, bgp->vrf_id);
 	stream_putc(s, advertise);
-	stream_put3(s, vni);
+	stream_putl(s, vni);
 	stream_putw_at(s, 0, stream_get_endp(s));
 
 	return zclient_send_message(bgp_zclient);
@@ -3393,6 +3393,24 @@ static void bgp_zebra_connected(struct zclient *zclient)
 	 */
 }
 
+/* BGP has lost its connection with Zebra. */
+static void bgp_zebra_disconnected(struct zclient *zclient)
+{
+	struct bgp *bgp;
+	struct listnode *node;
+
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
+		/* zebra has lost the SIDs of BGP */
+		vpn_leak_zebra_vrf_sids_forget(bgp);
+		if (bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)
+			bgp_srv6_unicast_sids_forget(bgp);
+
+		/* the locators may have changed when zebra is started again */
+		srv6_locator_free(bgp->srv6_locator);
+		bgp->srv6_locator = NULL;
+	}
+}
+
 void bgp_zebra_process_remote_routes_for_l2vni(struct event *e)
 {
 	/*
@@ -3753,6 +3771,10 @@ static int bgp_ifp_create(struct interface *ifp)
 		vpn_leak_zebra_vrf_label_update(bgp, AFI_IP6);
 		vpn_leak_zebra_vrf_sid_update(bgp, AFI_IP);
 		vpn_leak_zebra_vrf_sid_update(bgp, AFI_IP6);
+		/* Be careful when changing: this call is also responsible for
+		 * processing deferred route leaks when default BGP instance is
+		 * created
+		 */
 		vpn_leak_postchange_all();
 	}
 
@@ -4688,6 +4710,7 @@ void bgp_zebra_init(struct event_loop *master, unsigned short instance)
 	zclient_init(bgp_zclient, ZEBRA_ROUTE_BGP, 0, &bgpd_privs);
 	bgp_zclient->zebra_buffer_write_ready = bgp_zebra_buffer_write_ready;
 	bgp_zclient->zebra_connected = bgp_zebra_connected;
+	bgp_zclient->zebra_disconnected = bgp_zebra_disconnected;
 	bgp_zclient->zebra_capabilities = bgp_zebra_capabilities;
 	bgp_zclient->nexthop_update = bgp_nexthop_update;
 	bgp_zclient->instance = instance;

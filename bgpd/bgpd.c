@@ -6716,12 +6716,9 @@ int peer_default_originate_set(struct peer *peer, afi_t afi, safi_t safi,
 {
 	struct peer *member;
 	struct listnode *node, *nnode;
-	struct update_subgroup *subgrp;
 
 	/* Set flag and configuration on peer. */
 	peer_af_flag_set(peer, afi, safi, PEER_FLAG_DEFAULT_ORIGINATE);
-
-	subgrp = peer_subgroup(peer, afi, safi);
 
 	if (rmap) {
 		if (!peer->bgp->rmap_def_originate_eval_timer)
@@ -6739,17 +6736,6 @@ int peer_default_originate_set(struct peer *peer, afi_t afi, safi_t safi,
 				      peer->default_rmap[afi][safi].name);
 			}
 
-			/*
-			 * When there is a change in route-map policy,
-			 * this flow gets triggered. Since, the default
-			 * route is already originated, the flag is set.
-			 * The flag should be unset here,
-			 * to trigger the flow of sending update message.
-			 */
-			if (subgrp)
-				UNSET_FLAG(subgrp->sflags,
-					   SUBGRP_STATUS_DEFAULT_ORIGINATE);
-
 			route_map_counter_decrement(map);
 			peer->default_rmap[afi][safi].name =
 				XSTRDUP(MTYPE_ROUTE_MAP_NAME, rmap);
@@ -6766,15 +6752,6 @@ int peer_default_originate_set(struct peer *peer, afi_t afi, safi_t safi,
 			      peer->default_rmap[afi][safi].name);
 		}
 
-		/*
-		 * This is triggered in case of route-map deletion.
-		 * The flag needs to be unset, to trigger the flow
-		 * of sending an update message.
-		 */
-		if (subgrp)
-			UNSET_FLAG(subgrp->sflags,
-				   SUBGRP_STATUS_DEFAULT_ORIGINATE);
-
 		route_map_counter_decrement(map);
 		peer->default_rmap[afi][safi].name = NULL;
 		peer->default_rmap[afi][safi].map = NULL;
@@ -6782,11 +6759,16 @@ int peer_default_originate_set(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Check if handling a regular peer. */
 	if (!CHECK_FLAG(peer->sflags, PEER_STATUS_GROUP)) {
-		/* Update peer route announcements. */
+		/*
+		 * Originate the synthesized default.  Since default-originate
+		 * affects update-group membership, the adjust call may move the
+		 * peer to a new subgroup, leaving queued work behind.  A full
+		 * table walk via bgp_announce_route() rebuilds any lost work.
+		 */
 		if (peer_established(peer->connection) &&
 		    peer->afc_nego[afi][safi]) {
 			update_group_adjust_peer(peer_af_find(peer, afi, safi));
-			bgp_default_originate(peer, afi, safi, false);
+			bgp_default_originate_config(peer, afi, safi);
 			bgp_announce_route(peer, afi, safi, false);
 		}
 
@@ -6828,12 +6810,14 @@ int peer_default_originate_set(struct peer *peer, afi_t afi, safi_t safi,
 			route_map_counter_increment(route_map);
 		}
 
-		/* Update peer route announcements. */
+		/*
+		 * Originate the synthesized default and rebuild any queued
+		 * work lost due to update-group membership change.
+		 */
 		if (peer_established(member->connection) &&
 		    member->afc_nego[afi][safi]) {
-			update_group_adjust_peer(
-				peer_af_find(member, afi, safi));
-			bgp_default_originate(member, afi, safi, false);
+			update_group_adjust_peer(peer_af_find(member, afi, safi));
+			bgp_default_originate_config(member, afi, safi);
 			bgp_announce_route(member, afi, safi, false);
 		}
 	}
@@ -6872,13 +6856,22 @@ int peer_default_originate_unset(struct peer *peer, afi_t afi, safi_t safi)
 		peer->default_rmap[afi][safi].map = NULL;
 	}
 
-	/* Check if handling a regular peer. */
+	/*
+	 * Check if handling a regular peer.  Since default-originate affects
+	 * update-group membership, the adjust call may move the peer to a new
+	 * subgroup, leaving queued work behind.  A full table walk via
+	 * bgp_announce_route() rebuilds any lost work.
+	 */
 	if (!CHECK_FLAG(peer->sflags, PEER_STATUS_GROUP)) {
-		/* Update peer route announcements. */
 		if (peer_established(peer->connection) &&
 		    peer->afc_nego[afi][safi]) {
 			update_group_adjust_peer(peer_af_find(peer, afi, safi));
-			bgp_default_originate(peer, afi, safi, true);
+			if (CHECK_FLAG(peer->af_flags[afi][safi], PEER_FLAG_DEFAULT_ORIGINATE))
+				/* Inherited from peer-group, re-originate */
+				bgp_default_originate_config(peer, afi, safi);
+			else
+				/* Fully removed, withdraw and advertise table */
+				bgp_default_originate_unconfig(peer, afi, safi);
 			bgp_announce_route(peer, afi, safi, false);
 		}
 
@@ -6913,11 +6906,14 @@ int peer_default_originate_unset(struct peer *peer, afi_t afi, safi_t safi)
 		member->default_rmap[afi][safi].name = NULL;
 		member->default_rmap[afi][safi].map = NULL;
 
-		/* Update peer route announcements. */
+		/*
+		 * Withdraw synthesized default and rebuild any queued work
+		 * lost due to update-group membership change.
+		 */
 		if (peer_established(member->connection) &&
 		    member->afc_nego[afi][safi]) {
 			update_group_adjust_peer(peer_af_find(member, afi, safi));
-			bgp_default_originate(member, afi, safi, true);
+			bgp_default_originate_unconfig(member, afi, safi);
 			bgp_announce_route(member, afi, safi, false);
 		}
 	}
@@ -9465,8 +9461,6 @@ int peer_clear(struct peer *peer, struct listnode **nnode)
 int peer_clear_soft(struct peer *peer, afi_t afi, safi_t safi,
 		    enum bgp_clear_type stype)
 {
-	struct peer_af *paf;
-
 	if (!peer_established(peer->connection))
 		return 0;
 
@@ -9475,17 +9469,8 @@ int peer_clear_soft(struct peer *peer, afi_t afi, safi_t safi,
 
 	peer->rtt = sockopt_tcp_rtt(peer->connection->fd);
 
-	if (stype == BGP_CLEAR_SOFT_OUT || stype == BGP_CLEAR_SOFT_BOTH) {
-		/* Clear the "neighbor x.x.x.x default-originate" flag */
-		paf = peer_af_find(peer, afi, safi);
-		if (paf && paf->subgroup
-		    && CHECK_FLAG(paf->subgroup->sflags,
-				  SUBGRP_STATUS_DEFAULT_ORIGINATE))
-			UNSET_FLAG(paf->subgroup->sflags,
-				   SUBGRP_STATUS_DEFAULT_ORIGINATE);
-
+	if (stype == BGP_CLEAR_SOFT_OUT || stype == BGP_CLEAR_SOFT_BOTH)
 		bgp_announce_route(peer, afi, safi, true);
-	}
 
 	if (stype == BGP_CLEAR_SOFT_IN_ORF_PREFIX) {
 		if (CHECK_FLAG(peer->af_cap[afi][safi],

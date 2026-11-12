@@ -540,11 +540,11 @@ void bfd_session_disable(struct bfd_session *bs)
 	bfd_recvtimer_delete(bs);
 	bfd_xmttimer_delete(bs);
 	ptm_bfd_echo_stop(bs);
-	bs->vrf = NULL;
-	bs->ifp = NULL;
 
 	/* Set session down so it doesn't report UP and disabled. */
 	ptm_bfd_sess_dn(bs, BD_PATH_DOWN, false);
+	bs->vrf = NULL;
+	bs->ifp = NULL;
 }
 
 static uint32_t ptm_bfd_gen_ID(void)
@@ -2922,7 +2922,7 @@ unsigned long bfd_get_session_count(void)
 	return bfd_key_hash->count;
 }
 
-struct sbfd_reflector *sbfd_reflector_new(const uint32_t discr, struct in6_addr *sip)
+void sbfd_reflector_new(const uint32_t discr, struct in6_addr *sip)
 {
 	struct sbfd_reflector *sr;
 	struct vrf *vrf;
@@ -2930,7 +2930,7 @@ struct sbfd_reflector *sbfd_reflector_new(const uint32_t discr, struct in6_addr 
 
 	sr = sbfd_discr_lookup(discr);
 	if (sr)
-		return sr;
+		return;
 
 	sr = XCALLOC(MTYPE_SBFD_REFLECTOR, sizeof(*sr));
 	sr->discr = discr;
@@ -2948,8 +2948,6 @@ struct sbfd_reflector *sbfd_reflector_new(const uint32_t discr, struct in6_addr 
 			bvrf->bg_reflector_count++;
 		}
 	}
-
-	return sr;
 }
 
 void sbfd_reflector_free(const uint32_t discr)

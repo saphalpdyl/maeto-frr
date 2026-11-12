@@ -44,8 +44,22 @@ sys.path.append(os.path.join(CWD, "../"))
 # pylint: disable=C0413
 # Import topogen and topotest helpers
 from lib import topotest
+from lib.common_config import kill_router_daemons, start_router_daemons
+from lib.evpn import (
+    evpn_verify_bgp_es_vtep,
+    evpn_verify_df_role,
+    evpn_verify_es_kernel_nexthop,
+    evpn_verify_mh_mac,
+    evpn_verify_protodown_reason,
+    evpn_verify_zebra_es_vtep,
+)
 
 # Required to instantiate the topology builder class.
+from lib.common_config import (
+    create_address_on_interface,
+    create_interface_in_kernel,
+    shutdown_bringup_interface_in_kernel,
+)
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
 
@@ -56,6 +70,17 @@ from lib.topolog import logger
 ## Same topology as test_evpn_mh.py but with IPv6 VTEP addresses
 ## and EBGP numbered peering
 #####################################################
+
+
+def setup_module(module):
+    if not topotest.platform_has_vrf():
+        pytest.skip("platform does not support VRF")
+
+    if not topotest.platform_has_evpn():
+        pytest.skip("platform does not support EVPN")
+
+    if not topotest.platform_has_pimv6():
+        pytest.skip("platform does not support PIMv6")
 
 
 def build_topo(tgen):
@@ -414,11 +439,11 @@ def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
     )
 
     for bond_member in bond_members:
-        node.run("ip link set dev %s down" % bond_member)
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_member, False)
         node.run("ip link set dev %s master %s" % (bond_member, bond_name))
-        node.run("ip link set dev %s up" % bond_member)
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_member, True)
 
-    node.run("ip link set dev %s up" % bond_name)
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_name, True)
 
     # if bridge is specified add the bond as a bridge member
     if br:
@@ -435,10 +460,10 @@ def config_mcast_tunnel_termination_device(node):
     The kernel requires a device to terminate VxLAN multicast tunnels
     when EVPN-PIM is used for flooded traffic
     """
-    node.run("ip link add dev ipmr-lo type dummy")
+    create_interface_in_kernel(node.tgen, node.name, "ipmr-lo")
     node.run("ip link set dev ipmr-lo mtu 16000")
     node.run("ip link set dev ipmr-lo mode dormant")
-    node.run("ip link set dev ipmr-lo up")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "ipmr-lo", True)
 
 
 def config_bridge(node):
@@ -454,7 +479,7 @@ def config_bridge(node):
     node.run("ip link set dev br_default type bridge ageing_time 1800")
     node.run("ip link set dev br_default type bridge mcast_snooping 0")
     node.run("ip link set dev br_default type bridge vlan_stats_enabled 1")
-    node.run("ip link set dev br_default up")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "br_default", True)
     # Self VLAN entries for all L2VNIs and L3VNI VLANs derived from the maps
     for vid in sorted(VLAN_VNI_VRF.keys()):
         node.run(f"/sbin/bridge vlan add vid {vid} dev br_default self")
@@ -499,7 +524,7 @@ def config_vxlan(node, node_ip):
         node.run(f"/sbin/bridge vlan add dev vxlan48 vid {vid}")
         node.run(f"/sbin/bridge vlan add dev vxlan48 vid {vid} tunnel_info id {vni}")
 
-    node.run("ip link set dev vxlan48 up")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "vxlan48", True)
 
 
 def config_l3vni(node, node_ip):
@@ -528,21 +553,21 @@ def config_svi(node, svi_pip):
             f"type vlan id {vid} protocol 802.1q"
         )
         node.run(f"ip link set dev {vlan_name} master {vrf}")
-        node.run(f"ip link set dev {vlan_name} up")
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, vlan_name, True)
         node.run(f"/sbin/sysctl net.ipv6.conf.{vlan_name}.accept_dad=0")
         node.run(f"/sbin/sysctl net.ipv6.conf.{vlan_name}.dad_transmits=0")
 
     if active_ip_version == "ipv6":
         # Assign IPv6 anycast GW only to VLAN 1000 in vrf1
-        node.run("ip -6 addr add %s/64 dev vlan1000" % svi_pip)
+        create_address_on_interface(node.tgen, node.name, "vlan1000", "%s/64" % svi_pip)
     else:
         # Preserve legacy IPv4 anycast gateway behavior used by MAC learning tests.
-        node.run("ip addr add %s/24 dev vlan1000" % svi_pip)
+        create_address_on_interface(node.tgen, node.name, "vlan1000", "%s/24" % svi_pip)
         node.run("/sbin/sysctl net.ipv4.conf.vlan1000.arp_accept=1")
         node.run("ip link add link vlan1000 name vlan1000-v0 type macvlan mode private")
         node.run("ip link set dev vlan1000-v0 address 00:00:5e:00:01:01")
-        node.run("ip link set dev vlan1000-v0 up")
-        node.run("ip addr add 45.0.0.1/24 dev vlan1000-v0")
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, "vlan1000-v0", True)
+        create_address_on_interface(node.tgen, node.name, "vlan1000-v0", "45.0.0.1/24")
 
 
 def config_vrf_l3vni(node):
@@ -555,7 +580,7 @@ def config_vrf_l3vni(node):
     vrf_tables = {"vrf1": 1001, "vrf2": 1002}
     for vrf, table in vrf_tables.items():
         node.run(f"ip link add {vrf} type vrf table {table} 2>/dev/null || true")
-        node.run(f"ip link set dev {vrf} up")
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, vrf, True)
 
     # Create L3VNI VLAN interfaces and attach them to the appropriate VRFs
     for l3vni, vrf in L3VNI_VRF.items():
@@ -565,7 +590,7 @@ def config_vrf_l3vni(node):
             f"type vlan id {l3vni} protocol 802.1q"
         )
         node.run(f"ip link set dev {vlan_name} master {vrf}")
-        node.run(f"ip link set dev {vlan_name} up")
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, vlan_name, True)
         node.run(f"/sbin/sysctl net.ipv6.conf.{vlan_name}.accept_dad=0")
         node.run(f"/sbin/sysctl net.ipv6.conf.{vlan_name}.dad_transmits=0")
 
@@ -589,10 +614,10 @@ def config_tor(tor_name, tor, tor_ip, svi_pip, ip_version):
         ipv4_lo = "10.0.0.18"
 
     if ip_version == "ipv4":
-        tor.run("ip addr add %s/32 dev lo" % tor_ip)
+        create_address_on_interface(tor.tgen, tor.name, "lo", "%s/32" % tor_ip)
     else:
-        tor.run("ip addr add %s/32 dev lo" % ipv4_lo)
-        tor.run("ip -6 addr add %s/128 dev lo" % tor_ip)
+        create_address_on_interface(tor.tgen, tor.name, "lo", "%s/32" % ipv4_lo)
+        create_address_on_interface(tor.tgen, tor.name, "lo", "%s/128" % tor_ip)
 
     # Add IPv6 underlay addresses on uplink interfaces using iproute2 as well.
     # This avoids timing/race issues where, when using frr-reload.py, BGP may
@@ -602,10 +627,7 @@ def config_tor(tor_name, tor, tor_ip, svi_pip, ip_version):
     if ip_version == "ipv6":
         uplinks = tor_uplink_ipv6.get(tor_name, {})
     for ifname, prefix in uplinks.items():
-        if ip_version == "ipv6":
-            tor.run("ip -6 addr add %s dev %s" % (prefix, ifname))
-        else:
-            tor.run("ip addr add %s dev %s" % (prefix, ifname))
+        create_address_on_interface(tor.tgen, tor.name, ifname, prefix)
 
     # create VRFs and L3VNI VLANs based on L3VNI_VRF
     config_bridge(tor)
@@ -616,7 +638,7 @@ def config_tor(tor_name, tor, tor_ip, svi_pip, ip_version):
     # each TOR has unique loopback-style addresses in each VRF.
     vrf_ips = VRF_IPV4.get(tor_name, {})
     for vrf, addr in vrf_ips.items():
-        tor.run(f"ip addr add {addr} dev {vrf}")
+        create_address_on_interface(tor.tgen, tor.name, vrf, addr)
 
     # create hostbonds; we will attach them to the bridge explicitly
     if "torm1" in tor_name:
@@ -658,12 +680,12 @@ def setup_vtep_mh(tgen, tor_name, tor_ip, svi_pip, ip_version):
     # Cleanup any existing SVD-related interfaces
     cleanup_cmds = [
         # SVIs and L3VNI VLANs
-        "ip link set dev vlan1000 down 2>/dev/null || true",
-        "ip link set dev vlan1001 down 2>/dev/null || true",
-        "ip link set dev vlan1002 down 2>/dev/null || true",
-        "ip link set dev vlan1003 down 2>/dev/null || true",
-        "ip link set dev vlan4000 down 2>/dev/null || true",
-        "ip link set dev vlan4001 down 2>/dev/null || true",
+        ("down", "vlan1000"),
+        ("down", "vlan1001"),
+        ("down", "vlan1002"),
+        ("down", "vlan1003"),
+        ("down", "vlan4000"),
+        ("down", "vlan4001"),
         "ip link del vlan1000 2>/dev/null || true",
         "ip link del vlan1001 2>/dev/null || true",
         "ip link del vlan1002 2>/dev/null || true",
@@ -671,17 +693,22 @@ def setup_vtep_mh(tgen, tor_name, tor_ip, svi_pip, ip_version):
         "ip link del vlan4000 2>/dev/null || true",
         "ip link del vlan4001 2>/dev/null || true",
         # VXLAN and bridge
-        "ip link set dev vxlan48 down 2>/dev/null || true",
+        ("down", "vxlan48"),
         "ip link del vxlan48 2>/dev/null || true",
-        "ip link set dev br_default down 2>/dev/null || true",
+        ("down", "br_default"),
         "ip link del br_default 2>/dev/null || true",
         # VRFs
-        "ip link set dev vrf1 down 2>/dev/null || true",
-        "ip link set dev vrf2 down 2>/dev/null || true",
+        ("down", "vrf1"),
+        ("down", "vrf2"),
         "ip link del vrf1 2>/dev/null || true",
         "ip link del vrf2 2>/dev/null || true",
     ]
     for cmd in cleanup_cmds:
+        if isinstance(cmd, tuple):
+            shutdown_bringup_interface_in_kernel(
+                tor.tgen, tor.name, cmd[1], cmd[0] == "up"
+            )
+            continue
         tor.run(cmd)
 
     # Now configure SVD data plane and host bonds using existing helper
@@ -721,7 +748,7 @@ def config_host(host_name, host):
     config_bond(host, bond_name, bond_members, "00:00:00:00:00:00", None)
 
     host_ip, host_mac = compute_host_ip_mac(host_name)
-    host.run("ip addr add %s dev %s" % (host_ip, bond_name))
+    create_address_on_interface(host.tgen, host.name, bond_name, host_ip)
     host.run("ip link set dev %s address %s" % (bond_name, host_mac))
 
 
@@ -938,7 +965,14 @@ def tgen_and_ip_version(request):
     # Run this inside the torm11 namespace so that vtysh talks to the correct daemons.
     if torm11 is not None:
         logger.info("Running frr-reload.py on torm11 unified config")
-        cmd = "/usr/lib/frr/frr-reload.py --reload /etc/frr/frr.conf"
+        vtysh_path = torm11.run("command -v vtysh").strip()
+        if not vtysh_path:
+            pytest.fail("frr-reload requires vtysh, but it is not in torm11's PATH")
+        cmd = (
+            "/usr/lib/frr/frr-reload.py --bindir {} --reload /etc/frr/frr.conf".format(
+                os.path.dirname(vtysh_path)
+            )
+        )
         # Run this inside the torm11 namespace (TopoRouter.net is the underlying node)
         rc, out, err = torm11.net.cmd_status(cmd, warn=False)
         if rc:
@@ -1000,7 +1034,10 @@ def tgen_and_ip_version(request):
 
 def check_local_es(esi, vtep_ips, dut_name, down_vteps):
     """
-    Check if ES peers are setup correctly on local ESs
+    Compare a local ES VTEP list with this topology's rack peers.
+
+    A single VTEP, DF role, or kernel nexthop belongs in lib.evpn. This
+    helper stays here because it knows which ToRs share a rack.
     """
     peer_ips = []
     if "torm1" in dut_name:
@@ -1164,7 +1201,12 @@ def test_evpn_ead_update(tgen_and_ip_version):
     # down a remote host link and check if the EAD withdraw is rxed
     # Note: LACP is not working as expected so I am temporarily shutting
     # down the link on the remote TOR instead of the remote host
-    remote_tor.run("ip link set dev %s-%s down" % (remote_tor_name, "eth2"))
+    shutdown_bringup_interface_in_kernel(
+        remote_tor.tgen,
+        remote_tor.name,
+        f"{remote_tor_name}-{'eth2'}",
+        False,
+    )
     down_vteps.append(tor_ips.get(remote_tor_name))
     _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
     assertmsg = '"{}" ES incorrect after remote link down'.format(dut_name)
@@ -1172,10 +1214,109 @@ def test_evpn_ead_update(tgen_and_ip_version):
 
     # bring up remote host link and check if the EAD update is rxed
     down_vteps.remove(tor_ips.get(remote_tor_name))
-    remote_tor.run("ip link set dev %s-%s up" % (remote_tor_name, "eth2"))
+    shutdown_bringup_interface_in_kernel(
+        remote_tor.tgen,
+        remote_tor.name,
+        f"{remote_tor_name}-{'eth2'}",
+        True,
+    )
     _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
     assertmsg = '"{}" ES incorrect after remote link flap'.format(dut_name)
     assert result is None, assertmsg
+
+
+def test_evpn_mh_peer_withdraw_during_bgpd_restart(tgen_and_ip_version):
+    """
+    A peer EAD withdrawal while bgpd is down must remove its ES VTEP in zebra.
+
+    zebra stays alive on torm12 while its bgpd is stopped. torm11 then withdraws
+    the Type-1/EAD for hostd11. Before the trigger, during the outage, and
+    after bgpd returns, bgpd, zebra, and the kernel FDB nexthop must agree on
+    that VTEP. The victim must finish as DF.
+    """
+    tgen, ip_version = tgen_and_ip_version
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    victim_name = "torm12"
+    peer_name = "torm11"
+    observer_name = "torm21"
+    victim = tgen.gears[victim_name]
+    peer = tgen.gears[peer_name]
+    observer = tgen.gears[observer_name]
+    esi = host_es_map["hostd11"]
+    peer_vtep = tor_ips[peer_name]
+    peer_access_link = "%s-eth2" % peer_name
+    bgpd_stopped = False
+    peer_link_down = False
+
+    try:
+        # Both daemons and the kernel must first agree that torm12's local ES
+        # still has its torm11 peer, and that torm12 is the non-DF.
+        for check in (
+            evpn_verify_bgp_es_vtep,
+            evpn_verify_zebra_es_vtep,
+            evpn_verify_es_kernel_nexthop,
+        ):
+            test_fn = partial(check, victim, esi, peer_vtep, True)
+            _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+            assert result is None, "before bgpd stop: %s" % (result,)
+
+        test_fn = partial(evpn_verify_df_role, victim, esi, "nonDF")
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assert result is None, "before bgpd stop: %s" % (result,)
+
+        # Keep zebra running. Its BGP client-close cleanup is the behavior
+        # under test, so restarting zebra would discard the stale state.
+        kill_router_daemons(tgen, victim_name, ["bgpd"])
+        bgpd_stopped = True
+
+        # torm11 owns one half of hostd11's ES. Losing its access link withdraws
+        # that Type-1/EAD while torm12 cannot send REMOTE_ES_VTEP_DEL to zebra.
+        peer.run("ip link set dev %s down" % peer_access_link)
+        peer_link_down = True
+
+        # A live remote observer proves torm11's EAD withdrawal reached the
+        # EVPN fabric. The victim's bgpd is down, so its zebra and kernel are
+        # the producers that must already have dropped the VTEP.
+        test_fn = partial(evpn_verify_bgp_es_vtep, observer, esi, peer_vtep, False)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assert result is None, "peer EAD withdrawal did not converge: %s" % (result,)
+
+        for check in (evpn_verify_zebra_es_vtep, evpn_verify_es_kernel_nexthop):
+            test_fn = partial(check, victim, esi, peer_vtep, False)
+            _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+            assert result is None, "during bgpd stop: %s" % (result,)
+
+        test_fn = partial(evpn_verify_df_role, victim, esi, "DF")
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assert result is None, "during bgpd stop: %s" % (result,)
+
+        start_router_daemons(tgen, victim_name, ["bgpd"])
+        bgpd_stopped = False
+
+        # The new bgpd relearns the withdrawn EAD and must not put the VTEP
+        # back. zebra and the kernel must still agree, and the victim stays DF.
+        for check in (
+            evpn_verify_bgp_es_vtep,
+            evpn_verify_zebra_es_vtep,
+            evpn_verify_es_kernel_nexthop,
+        ):
+            test_fn = partial(check, victim, esi, peer_vtep, False)
+            _, result = topotest.run_and_expect(test_fn, None, count=30, wait=2)
+            assert result is None, "after bgpd restart: %s" % (result,)
+
+        test_fn = partial(evpn_verify_df_role, victim, esi, "DF")
+        _, result = topotest.run_and_expect(test_fn, None, count=30, wait=2)
+        assert result is None, "after bgpd restart: %s" % (result,)
+    finally:
+        # Restore both daemons and the access link even when the stale-VTEP
+        # assertion fails, so later tests start from the original topology.
+        if bgpd_stopped:
+            start_router_daemons(tgen, victim_name, ["bgpd"])
+        if peer_link_down:
+            peer.run("ip link set dev %s up" % peer_access_link)
 
 
 def ping_anycast_gw(tgen):
@@ -1199,33 +1340,10 @@ def ping_anycast_gw(tgen):
 
 
 def check_mac(dut, vni, mac, m_type, esi, intf, ping_gw=False, tgen=None):
-    """
-    checks if mac is present and if desination matches the one provided
-    """
-
+    """Refresh host MACs when asked, then use the shared MH MAC check."""
     if ping_gw:
         ping_anycast_gw(tgen)
-
-    out = dut.vtysh_cmd("show evpn mac vni %d mac %s json" % (vni, mac))
-
-    tmp_esi = None
-    mac_js = json.loads(out)
-    for mac, info in mac_js.items():
-        tmp_esi = info.get("esi", "")
-        tmp_m_type = info.get("type", "")
-        tmp_intf = info.get("intf", "") if tmp_m_type == "local" else ""
-        if tmp_esi == esi and tmp_m_type == m_type and tmp_intf == intf:
-            return None
-
-    return "invalid vni %d mac %s expected esi %s, %s m_type %s and intf %s out %s" % (
-        vni,
-        mac,
-        tmp_esi,
-        esi,
-        m_type,
-        intf,
-        mac_js,
-    )
+    return evpn_verify_mh_mac(dut, vni, mac, m_type, esi, intf)
 
 
 def test_evpn_mac(tgen_and_ip_version):
@@ -1273,25 +1391,6 @@ def test_evpn_mac(tgen_and_ip_version):
         assert result is None, assertmsg
 
 
-def check_df_role(dut, esi, role):
-    """
-    Return error string if the df role on the dut is different
-    """
-    es_json = dut.vtysh_cmd("show evpn es %s json" % esi)
-    es = json.loads(es_json)
-
-    if not es:
-        return "esi %s not found" % esi
-
-    flags = es.get("flags", [])
-    curr_role = "nonDF" if "nonDF" in flags else "DF"
-
-    if curr_role != role:
-        return "%s is %s for %s" % (dut.name, curr_role, esi)
-
-    return None
-
-
 def test_evpn_df(tgen_and_ip_version):
     """
     1. Check the DF role on all the PEs on rack-1.
@@ -1316,7 +1415,7 @@ def test_evpn_df(tgen_and_ip_version):
     # check roles on rack-1
     for tor in tors:
         role = "DF" if tor.name == df_node else "nonDF"
-        test_fn = partial(check_df_role, tor, esi, role)
+        test_fn = partial(evpn_verify_df_role, tor, esi, role)
         _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
         assertmsg = '"{}" DF role incorrect'.format(tor.name)
         assert result is None, assertmsg
@@ -1329,30 +1428,10 @@ def test_evpn_df(tgen_and_ip_version):
     # re-check roles on rack-1; we should have a new winner
     for tor in tors:
         role = "DF" if tor.name == df_node else "nonDF"
-        test_fn = partial(check_df_role, tor, esi, role)
+        test_fn = partial(evpn_verify_df_role, tor, esi, role)
         _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
         assertmsg = '"{}" DF role incorrect'.format(tor.name)
         assert result is None, assertmsg
-
-
-def check_protodown_rc(dut, protodown_rc):
-    """
-    check if specified protodown reason code is set
-    """
-
-    out = dut.vtysh_cmd("show evpn json")
-
-    evpn_js = json.loads(out)
-    tmp_rc = evpn_js.get("protodownReasons", [])
-
-    if protodown_rc:
-        if protodown_rc not in tmp_rc:
-            return "protodown %s missing in %s" % (protodown_rc, tmp_rc)
-    else:
-        if tmp_rc:
-            return "unexpected protodown rc %s" % (tmp_rc)
-
-    return None
 
 
 def test_evpn_uplink_tracking(tgen_and_ip_version):
@@ -1369,27 +1448,27 @@ def test_evpn_uplink_tracking(tgen_and_ip_version):
     dut = tgen.gears[dut_name]
 
     # wait for protodown rc to clear after startup
-    test_fn = partial(check_protodown_rc, dut, None)
+    test_fn = partial(evpn_verify_protodown_reason, dut, None)
     _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
     assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
     assert result is None, assertmsg
 
     # disable the uplinks
-    dut.run("ip link set %s-eth0 down" % dut_name)
-    dut.run("ip link set %s-eth1 down" % dut_name)
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth0", False)
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth1", False)
 
     # check if the access ports have been protodowned
-    test_fn = partial(check_protodown_rc, dut, "uplinkDown")
+    test_fn = partial(evpn_verify_protodown_reason, dut, "uplinkDown")
     _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
     assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
     assert result is None, assertmsg
 
     # enable the uplinks
-    dut.run("ip link set %s-eth0 up" % dut_name)
-    dut.run("ip link set %s-eth1 up" % dut_name)
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth0", True)
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth1", True)
 
     # check if the access ports have been moved out of protodown
-    test_fn = partial(check_protodown_rc, dut, None)
+    test_fn = partial(evpn_verify_protodown_reason, dut, None)
     _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
     assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
     assert result is None, assertmsg

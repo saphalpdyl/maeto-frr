@@ -29,6 +29,7 @@ from lib import topotest
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
 from lib.checkping import check_ping
+from lib.common_config import shutdown_bringup_interface_in_kernel
 
 pytestmark = [pytest.mark.staticd]
 
@@ -126,6 +127,58 @@ def test_srv6_static_sids():
     # please use tgen.mininet_cli() to start it.
 
     logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_locator_prefix_replay():
+    """
+    Enter the same prefix again in the locator and verify that the SIDs
+    allocated from it are not reinstalled (the locator must not flap)
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # staticd has not removed any route yet: a locator flap would make it
+    # remove all its SID routes, and install them again.
+    expected = open_json_file(
+        "{}/{}".format(CWD, "expected_srv6_sids_no_route_delete.json")
+    )
+    result = topotest.router_json_cmp(router, "show zebra client json", expected)
+    assert result is None, "staticd already removed routes"
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator MAIN
+             prefix fcbb:bbbb:1::/48 block-len 32 node-len 16 func-bits 16
+        """
+    )
+
+    # Add a SID and wait for its route: staticd gets its allocation from
+    # zebra after the locator updates of the replay, if any, so their
+    # effects on the routes of the SIDs have been processed once it is
+    # installed.
+    sid_cmd = """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            {}sid fcbb:bbbb:1:fe90::/64 locator MAIN behavior uDT6 vrf Vrf40
+        """
+    router.vtysh_cmd(sid_cmd.format(""))
+    check_srv6_static_sid_route(router, "fcbb:bbbb:1:fe90::/64", True)
+
+    logger.info("Test that the SID routes are not reinstalled")
+    result = topotest.router_json_cmp(router, "show zebra client json", expected)
+    assert result is None, "staticd removed its SID routes"
+
+    router.vtysh_cmd(sid_cmd.format("no "))
+    check_srv6_static_sid_route(router, "fcbb:bbbb:1:fe90::/64", False)
     check_srv6_static_sids(router, "expected_srv6_sids.json")
 
 
@@ -400,7 +453,7 @@ def test_srv6_static_sids_interface_down_up():
 
     # Bring down sr0 interface using ip link
     logger.info("Bringing down sr0 interface using ip link")
-    router.run("ip link set sr0 down")
+    shutdown_bringup_interface_in_kernel(router.tgen, router.name, "sr0", False)
 
     # Verify routes using sr0 are removed
     logger.info("Verifying routes using sr0 are removed")
@@ -408,7 +461,7 @@ def test_srv6_static_sids_interface_down_up():
 
     # Bring up sr0 interface using ip link
     logger.info("Bringing up sr0 interface using ip link")
-    router.run("ip link set sr0 up")
+    shutdown_bringup_interface_in_kernel(router.tgen, router.name, "sr0", True)
 
     # Verify routes are restored
     logger.info("Verifying routes are restored")
@@ -519,7 +572,12 @@ def test_srv6_static_sids_ua_neighbor_down():
 
     # Bring down r2 interface
     logger.info("Taking down r2-eth0 interface")
-    tgen.gears["r2"].run("ip link set r2-eth0 down")
+    shutdown_bringup_interface_in_kernel(
+        tgen.gears['r2'].tgen,
+        tgen.gears['r2'].name,
+        "r2-eth0",
+        False,
+    )
 
     # Flush neighbor entry on r1 to simulate neighbor unreachable
     logger.info("Flushing neighbor entry on r1")
@@ -546,7 +604,12 @@ def test_srv6_static_sids_ua_neighbor_recovery():
 
     # Bring up r2 interface
     logger.info("Bringing up r2-eth0 interface")
-    tgen.gears["r2"].run("ip link set r2-eth0 up")
+    shutdown_bringup_interface_in_kernel(
+        tgen.gears['r2'].tgen,
+        tgen.gears['r2'].name,
+        "r2-eth0",
+        True,
+    )
 
     # Wait for neighbor discovery and verify SID is installed
     check_ping("r1", "2001::2", True, 10, 1)

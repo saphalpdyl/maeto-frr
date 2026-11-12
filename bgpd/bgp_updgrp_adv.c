@@ -287,6 +287,14 @@ static int group_announce_route_walkcb(struct update_group *updgrp, void *arg)
 										   adj->addpath_tx_id);
 					}
 				}
+
+				/*
+				 * A subgroup that has already withdrawn the prefix
+				 * has nothing to send, but has still handled this
+				 * change. Without the version, it cannot merge with
+				 * the subgroups that did send the withdraw.
+				 */
+				subgrp->version = MAX(subgrp->version, ctx->dest->version);
 			}
 		}
 
@@ -722,8 +730,7 @@ void bgp_adj_out_unset_subgroup(struct bgp_dest *dest, struct update_subgroup *s
 		 * route, do not send withdraw. This will prevent deletion of
 		 * the default route at the peer.
 		 */
-		if (CHECK_FLAG(subgrp->sflags, SUBGRP_STATUS_DEFAULT_ORIGINATE)
-		    && is_default_prefix(bgp_dest_get_prefix(dest)))
+		if (subgrp->default_originate_attr && is_default_prefix(bgp_dest_get_prefix(dest)))
 			return;
 
 		if (adj->attr) {
@@ -821,7 +828,7 @@ void subgroup_announce_table(struct update_subgroup *subgrp,
 	if (safi != SAFI_MPLS_VPN && safi != SAFI_ENCAP && safi != SAFI_EVPN
 	    && CHECK_FLAG(peer->af_flags[afi][safi],
 			  PEER_FLAG_DEFAULT_ORIGINATE))
-		subgroup_default_originate(subgrp, false);
+		subgroup_default_originate(subgrp);
 
 	subgrp->pscount = 0;
 	SET_FLAG(subgrp->sflags, SUBGRP_STATUS_TABLE_REPARSING);
@@ -965,18 +972,217 @@ static route_map_result_t bgp_route_map_setting_only(struct bgp *bgp, struct rou
 	return ret;
 }
 
-void subgroup_default_originate(struct update_subgroup *subgrp, bool withdraw)
+/*
+ * Clean up adj-out entries for the default prefix (0.0.0.0/0 or ::/0)
+ * belonging to the subgroup.  Called when transitioning from
+ * "no default-originate" to "default-originate" to clear stale entries
+ * before the synthesized default takes over.
+ *
+ * Table route entries that were previously advertised must be withdrawn
+ * BEFORE the synthesized default is processed.  This ensures the peer
+ * receives the withdraw first, then the new synthesized default (if any).
+ *
+ * For Add-Path neighbors, each path has its own addpath_tx_id, so explicit
+ * withdraws are required.  For non-Add-Path, the withdraw is still needed
+ * because the default-originate condition may not be met.
+ *
+ * We first flush all pending packets (withdraws and updates), then add the
+ * table route withdraws directly to the bpacket queue.  This ensures proper
+ * ordering with the subsequent synthesized default UPDATE, regardless of
+ * whether the packet queue was full when we flushed.
+ */
+static void subgroup_default_originate_adj_out_cleanup(struct update_subgroup *subgrp)
+{
+	struct bgp *bgp;
+	struct prefix p;
+	struct bgp_dest *dest;
+	struct bgp_adj_out *adj, *adj_next;
+	afi_t afi;
+	safi_t safi_rib;
+
+	afi = SUBGRP_AFI(subgrp);
+	bgp = SUBGRP_PEER(subgrp)->bgp;
+
+	if (SUBGRP_SAFI(subgrp) == SAFI_LABELED_UNICAST)
+		safi_rib = SAFI_UNICAST;
+	else
+		safi_rib = SUBGRP_SAFI(subgrp);
+
+	/*
+	 * Flush all pending packets (withdraws and updates) to ensure proper
+	 * ordering with the table route withdraws and synthesized default
+	 * that will be added next.
+	 */
+	subgroup_withdraw_packet(subgrp);
+	subgroup_update_packet(subgrp);
+
+	memset(&p, 0, sizeof(p));
+	p.family = afi2family(afi);
+	p.prefixlen = 0;
+	dest = bgp_safi_node_lookup(bgp->rib[afi][safi_rib], safi_rib, &p, NULL);
+	if (!dest)
+		return;
+
+	/*
+	 * Process adj-out entries for the default prefix.  These are table
+	 * route entries (regular 0.0.0.0/0 from the RIB) that were previously
+	 * advertised.  The synthesized default-originate route is sent directly
+	 * via subgroup_default_update_packet() without using adj-out.
+	 *
+	 * We send the table route withdraw directly to the bpacket queue
+	 * (bypassing sync->withdraw) to guarantee ordering with the
+	 * synthesized default even when the packet queue limit is reached.
+	 */
+	RB_FOREACH_SAFE (adj, bgp_adj_out_rb, &dest->adj_out, adj_next) {
+		if (adj->subgroup != subgrp)
+			continue;
+
+		if (adj->adv)
+			bgp_advertise_clean_subgroup(subgrp, adj);
+
+		if (adj->attr) {
+			/* Table route was previously advertised - send withdraw directly */
+			subgroup_table_default_withdraw_packet(subgrp, adj->addpath_tx_id);
+			subgrp->scount--;
+			bgp_adj_out_remove_subgroup(dest, adj, subgrp);
+		} else {
+			adj_free(adj);
+		}
+	}
+
+	subgroup_trigger_write(subgrp);
+	bgp_dest_unlock_node(dest);
+}
+
+/*
+ * Handle the transition from "no default-originate" to "default-originate".
+ * This is called once when the configuration is applied.
+ *
+ * Clears any stale adj-out entries for the default prefix (0.0.0.0/0 or ::/0)
+ * that were created when the table route was advertised via the normal path.
+ * The synthesized default-originate route will take precedence.
+ */
+void subgroup_default_originate_config(struct update_subgroup *subgrp)
+{
+	if (!subgrp)
+		return;
+
+	if (!(SUBGRP_AFI(subgrp) == AFI_IP || SUBGRP_AFI(subgrp) == AFI_IP6))
+		return;
+
+	/* Clear stale adj-out entries for the default prefix. */
+	subgroup_default_originate_adj_out_cleanup(subgrp);
+
+	/* Now originate the synthesized default route. */
+	subgroup_default_originate(subgrp);
+}
+
+/*
+ * Handle the transition from "default-originate" to "no default-originate".
+ * This is called once when the configuration is removed.
+ *
+ * Withdraws the synthesized default if it was previously sent, then advertises
+ * the table's default route (0.0.0.0/0 or ::/0) if one exists.
+ *
+ * Note: No adj-out cleanup is needed here.  While default-originate is active,
+ * the table route is not advertised (subgroup_announce_check skips it), so
+ * there are no adj-out entries to clean up.
+ */
+void subgroup_default_originate_unconfig(struct update_subgroup *subgrp)
+{
+	struct bgp *bgp;
+	struct peer *peer;
+	struct prefix p;
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi;
+	afi_t afi;
+	safi_t safi;
+	safi_t safi_rib;
+	bool addpath_capable;
+
+	if (!subgrp)
+		return;
+
+	afi = SUBGRP_AFI(subgrp);
+	safi = SUBGRP_SAFI(subgrp);
+
+	if (!(afi == AFI_IP || afi == AFI_IP6))
+		return;
+
+	peer = SUBGRP_PEER(subgrp);
+	bgp = peer->bgp;
+
+	if (safi == SAFI_LABELED_UNICAST)
+		safi_rib = SAFI_UNICAST;
+	else
+		safi_rib = safi;
+
+	/* Build the default prefix for debug and table lookup. */
+	memset(&p, 0, sizeof(p));
+	p.family = afi2family(afi);
+	p.prefixlen = 0;
+
+	/*
+	 * Flush pending packets first to ensure proper ordering with the
+	 * withdraw and subsequent table route update.
+	 */
+	subgroup_withdraw_packet(subgrp);
+	subgroup_update_packet(subgrp);
+
+	/* Withdraw the synthesized default if it was previously sent. */
+	if (subgrp->default_originate_attr) {
+		if (bgp_debug_update(NULL, &p, subgrp->update_group, 0))
+			zlog_debug("u%" PRIu64 ":s%" PRIu64 " default-originate WITHDRAW (unset)",
+				   subgrp->update_group->id, subgrp->id);
+		bgp_attr_unintern(&subgrp->default_originate_attr);
+		subgrp->default_originate_attr = NULL;
+		subgroup_default_withdraw_packet(subgrp);
+	}
+
+	/* Advertise the table's default route if one exists. */
+	dest = bgp_safi_node_lookup(bgp->rib[afi][safi_rib], safi_rib, &p, NULL);
+	if (!dest)
+		return;
+
+	addpath_capable = bgp_addpath_encode_tx(peer, afi, safi_rib);
+
+	if (addpath_capable) {
+		/* For Add-Path, announce all eligible paths with proper path-limit */
+		subgrp_announce_addpath_best_selected(dest, subgrp);
+	} else {
+		/* For non-Add-Path, announce only the selected path */
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+			if (!CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
+				continue;
+
+			subgroup_process_announce_selected(subgrp, pi, dest, afi, safi_rib,
+							   bgp_addpath_id_for_peer(peer, afi,
+										   safi_rib,
+										   &pi->tx_addpath));
+		}
+	}
+	bgp_dest_unlock_node(dest);
+}
+
+/*
+ * Evaluate whether the default route should be originated to a subgroup and
+ * originate or withdraw it accordingly.  This is a pure re-evaluation path
+ * called from timer, policy changes, and table walks.
+ *
+ * For config changes (adding/removing default-originate), use
+ * subgroup_default_originate_config() or subgroup_default_originate_unconfig()
+ * instead.
+ */
+void subgroup_default_originate(struct update_subgroup *subgrp)
 {
 	struct bgp *bgp;
 	struct attr attr = { 0 };
 	struct attr *new_attr = &attr;
 	struct aspath *aspath;
-	struct prefix p;
 	struct peer *from;
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
 	struct peer *peer;
-	struct bgp_adj_out *adj;
 	route_map_result_t ret = RMAP_DENYMATCH;
 	route_map_result_t new_ret = RMAP_DENYMATCH;
 	afi_t afi;
@@ -986,6 +1192,9 @@ void subgroup_default_originate(struct update_subgroup *subgrp, bool withdraw)
 	int new_pref = 0;
 	int match_rules;
 	struct route_map *rmap;
+	struct prefix p;
+	bool do_withdraw = false;
+	bool do_debug;
 
 	if (!subgrp)
 		return;
@@ -996,6 +1205,20 @@ void subgroup_default_originate(struct update_subgroup *subgrp, bool withdraw)
 
 	if (!(afi == AFI_IP || afi == AFI_IP6))
 		return;
+
+	/* Build the default prefix for debug and route-map evaluation. */
+	memset(&p, 0, sizeof(p));
+	p.family = afi2family(afi);
+	p.prefixlen = 0;
+
+	do_debug = bgp_debug_update(NULL, &p, subgrp->update_group, 0);
+
+	/*
+	 * Flush pending packets to ensure proper ordering with the
+	 * synthesized default UPDATE or WITHDRAW.
+	 */
+	subgroup_withdraw_packet(subgrp);
+	subgroup_update_packet(subgrp);
 
 	if (safi == SAFI_LABELED_UNICAST)
 		safi_rib = SAFI_UNICAST;
@@ -1039,10 +1262,7 @@ void subgroup_default_originate(struct update_subgroup *subgrp, bool withdraw)
 			 * Route-map is configured but undefined or empty.
 			 * Treat as implicit deny - withdraw the default.
 			 */
-			if (!withdraw &&
-			    !CHECK_FLAG(subgrp->sflags, SUBGRP_STATUS_DEFAULT_ORIGINATE))
-				SET_FLAG(subgrp->sflags, SUBGRP_STATUS_DEFAULT_ORIGINATE);
-			withdraw = true;
+			do_withdraw = true;
 		}
 	}
 
@@ -1056,6 +1276,15 @@ void subgroup_default_originate(struct update_subgroup *subgrp, bool withdraw)
 	if (rmap && (match_rules != 0 ||
 		     !CHECK_FLAG(bgp->flags, BGP_FLAG_DEFAULT_ORIGINATE_SETONLY_UNCONDITIONAL))) {
 		struct bgp_path_info tmp_pi = {0};
+
+		if (!peer->default_rmap[afi][safi].map ||
+		    !peer->default_rmap[afi][safi].map->head) {
+			/* Route-map name is configured but the map is either
+			 * absent or empty.  Treat as unmet condition.
+			 */
+			do_withdraw = true;
+			goto rmap_done;
+		}
 
 		tmp_pi.peer = bgp->peer_self;
 
@@ -1106,146 +1335,112 @@ void subgroup_default_originate(struct update_subgroup *subgrp, bool withdraw)
 		}
 		bgp->peer_self->rmap_type = 0;
 
-		if (ret == RMAP_DENYMATCH) {
-			/*
-			 * If its a implicit withdraw due to routemap
-			 * deny operation need to set the flag back.
-			 * This is a conversion of update flow to
-			 * withdraw flow.
-			 */
-			if (!withdraw &&
-			    (!CHECK_FLAG(subgrp->sflags,
-					 SUBGRP_STATUS_DEFAULT_ORIGINATE)))
-				SET_FLAG(subgrp->sflags,
-					 SUBGRP_STATUS_DEFAULT_ORIGINATE);
-			withdraw = true;
-		}
+		if (ret == RMAP_DENYMATCH)
+			do_withdraw = true;
+rmap_done:;
 	}
 
-	/* Check if the default route is in local BGP RIB which is
-	 * installed through redistribute or network command
-	 */
-	memset(&p, 0, sizeof(p));
-	p.family = afi2family(afi);
-	p.prefixlen = 0;
-	dest = bgp_safi_node_lookup(bgp->rib[afi][safi_rib], safi_rib, &p,
-				    NULL);
-
-	if (withdraw) {
-		/* Withdraw the default route advertised using default
-		 * originate
-		 */
-		if (CHECK_FLAG(subgrp->sflags, SUBGRP_STATUS_DEFAULT_ORIGINATE))
+	if (do_withdraw) {
+		/* Withdraw the synthesized default if it was previously sent. */
+		if (subgrp->default_originate_attr) {
+			if (do_debug)
+				zlog_debug("u%" PRIu64 ":s%" PRIu64 " default-originate WITHDRAW",
+					   subgrp->update_group->id, subgrp->id);
+			bgp_attr_unintern(&subgrp->default_originate_attr);
+			subgrp->default_originate_attr = NULL;
 			subgroup_default_withdraw_packet(subgrp);
-		UNSET_FLAG(subgrp->sflags, SUBGRP_STATUS_DEFAULT_ORIGINATE);
-
-		/* If default route is present in the local RIB, advertise the
-		 * route
-		 */
-		if (dest) {
-			for (pi = bgp_dest_get_bgp_path_info(dest); pi;
-			     pi = pi->next) {
-				if (!CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
-					continue;
-
-				if (subgroup_announce_check(dest, pi, subgrp,
-							    bgp_dest_get_prefix(
-								    dest),
-							    &attr, NULL)) {
-					if (!bgp_adj_out_set_subgroup(dest,
-								      subgrp,
-								      &attr, pi))
-						bgp_attr_flush(&attr);
-				} else
-					bgp_attr_flush(&attr);
-			}
-			bgp_dest_unlock_node(dest);
 		}
 	} else {
-		if (!CHECK_FLAG(subgrp->sflags,
-				SUBGRP_STATUS_DEFAULT_ORIGINATE)) {
-			struct attr attr_copy;
+		struct attr attr_copy;
 
-			/* The 'neighbor x.x.x.x default-originate' default will
-			 * act as an
-			 * implicit withdraw for any previous UPDATEs sent for
-			 * 0.0.0.0/0 so
-			 * clear adj_out for the 0.0.0.0/0 prefix in the BGP
-			 * table.
-			 */
-			if (dest) {
-				/* Remove the adjacency for the previously
-				 * advertised default route
-				 */
-				adj = adj_lookup(
-				       dest, subgrp,
-				       BGP_ADDPATH_TX_ID_FOR_DEFAULT_ORIGINATE);
-				if (adj != NULL) {
-					/* Clean up previous advertisement.  */
-					if (adj->adv)
-						bgp_advertise_clean_subgroup(
-							subgrp, adj);
+		/*
+		 * Prepend local-AS for EBGP. Make a copy first since
+		 * new_attr may be interned (shared) when route-map
+		 * matched, and modifying it in place would corrupt
+		 * the attribute hash.
+		 */
+		bgp_attr_dup_into(&attr_copy, new_attr);
 
-					/* Free allocated information.  */
-					adj_free(adj);
-				}
-				bgp_dest_unlock_node(dest);
-			}
-
-			/*
-			 * Prepend local-AS for EBGP. Make a copy first since
-			 * new_attr may be interned (shared) when route-map
-			 * matched, and modifying it in place would corrupt
-			 * the attribute hash.
-			 */
-			bgp_attr_dup_into(&attr_copy, new_attr);
-
-			/* Apply set-only route-map to attr_copy (not new_attr)
-			 * to avoid memory leak - attr_copy will be flushed.
-			 * Only needed when table walk was skipped (new behavior).
-			 */
-			if (rmap && match_rules == 0 &&
-			    CHECK_FLAG(bgp->flags,
-				       BGP_FLAG_DEFAULT_ORIGINATE_SETONLY_UNCONDITIONAL)) {
-				if (bgp_route_map_setting_only(bgp, rmap, PEER_RMAP_TYPE_DEFAULT,
-							       &p, &attr_copy) == RMAP_DENYMATCH) {
-					/*
-					 * Route-map denied - withdraw default.
-					 * The flag may have been cleared by callers,
-					 * so withdraw unconditionally. This may send
-					 * an unnecessary withdraw, but a deny-only
-					 * route-map is not a practical scenario.
-					 */
-					bgp_attr_flush(&attr_copy);
-					aspath_unintern(&aspath);
+		/* Apply set-only route-map to attr_copy (not new_attr)
+		 * to avoid memory leak - attr_copy will be flushed.
+		 * Only needed when table walk was skipped (new behavior).
+		 */
+		if (rmap && match_rules == 0 &&
+		    CHECK_FLAG(bgp->flags, BGP_FLAG_DEFAULT_ORIGINATE_SETONLY_UNCONDITIONAL)) {
+			if (bgp_route_map_setting_only(bgp, rmap, PEER_RMAP_TYPE_DEFAULT, &p,
+						       &attr_copy) == RMAP_DENYMATCH) {
+				/* Route-map denied - withdraw default if previously sent. */
+				bgp_attr_flush(&attr_copy);
+				aspath_unintern(&aspath);
+				if (subgrp->default_originate_attr) {
+					if (do_debug)
+						zlog_debug("u%" PRIu64 ":s%" PRIu64
+							   " default-originate WITHDRAW (route-map deny)",
+							   subgrp->update_group->id, subgrp->id);
+					bgp_attr_unintern(&subgrp->default_originate_attr);
+					subgrp->default_originate_attr = NULL;
 					subgroup_default_withdraw_packet(subgrp);
-					UNSET_FLAG(subgrp->sflags, SUBGRP_STATUS_DEFAULT_ORIGINATE);
-					return;
 				}
-				/* Clear reflection attributes - default-originate
-				 * is self-originated, not reflected.
-				 */
-				bgp_attr_clear_reflection(&attr_copy);
+				return;
 			}
-
-			/* Add gshut community after set-only so route-map
-			 * cannot overwrite the shutdown signal.
+			/* Clear reflection attributes - default-originate
+			 * is self-originated, not reflected.
 			 */
-			if (bgp_in_graceful_shutdown(bgp) ||
-			    (CHECK_FLAG(peer->flags, PEER_FLAG_GRACEFUL_SHUTDOWN)))
-				bgp_attr_add_gshut_community(&attr_copy);
-
-			/* Handle "bgp max-med" */
-			if (bgp->maxmed_active)
-				bgp_attr_set_med(&attr_copy, bgp->maxmed_value);
-
-			bgp_peer_prepend_local_as(peer, afi, safi, &attr_copy);
-
-			SET_FLAG(subgrp->sflags,
-				 SUBGRP_STATUS_DEFAULT_ORIGINATE);
-			subgroup_default_update_packet(subgrp, &attr_copy, from);
-			bgp_attr_flush(&attr_copy);
+			bgp_attr_clear_reflection(&attr_copy);
 		}
+
+		/* Add gshut community after set-only so route-map
+		 * cannot overwrite the shutdown signal.
+		 */
+		if (bgp_in_graceful_shutdown(bgp) ||
+		    CHECK_FLAG(peer->flags, PEER_FLAG_GRACEFUL_SHUTDOWN))
+			bgp_attr_add_gshut_community(&attr_copy);
+
+		/* Handle "bgp max-med" */
+		if (bgp->maxmed_active)
+			bgp_attr_set_med(&attr_copy, bgp->maxmed_value);
+
+		bgp_peer_prepend_local_as(peer, afi, safi, &attr_copy);
+
+		/*
+		 * Suppress duplicate UPDATEs: bgp_attr_intern() returns
+		 * the same interned pointer for identical attribute
+		 * sets, so a pointer comparison is sufficient.  If the
+		 * attrs differ (or this is the first origination),
+		 * intern the new set, update the saved copy, and send
+		 * the UPDATE.  Otherwise drop the extra reference and
+		 * skip the redundant send.
+		 */
+		struct attr *new_interned = bgp_attr_intern(&attr_copy);
+
+		if (subgrp->default_originate_attr != new_interned) {
+			/* Attrs changed: update sentinel and send. */
+			if (do_debug)
+				zlog_debug("u%" PRIu64 ":s%" PRIu64 " default-originate UPDATE",
+					   subgrp->update_group->id, subgrp->id);
+			if (subgrp->default_originate_attr)
+				bgp_attr_unintern(&subgrp->default_originate_attr);
+			subgrp->default_originate_attr = new_interned;
+			subgroup_default_update_packet(subgrp, new_interned, from);
+		} else if (!CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_DUPLICATES) ||
+			   CHECK_FLAG(subgrp->sflags, SUBGRP_STATUS_FORCE_UPDATES)) {
+			/* Attrs unchanged but not suppressing: re-send. */
+			if (do_debug)
+				zlog_debug("u%" PRIu64 ":s%" PRIu64
+					   " default-originate UPDATE (re-send)",
+					   subgrp->update_group->id, subgrp->id);
+			subgroup_default_update_packet(subgrp, new_interned, from);
+			bgp_attr_unintern(&new_interned);
+		} else {
+			/* Attrs unchanged: suppress duplicate. */
+			if (do_debug)
+				zlog_debug("u%" PRIu64 ":s%" PRIu64
+					   " default-originate UPDATE suppressed (duplicate)",
+					   subgrp->update_group->id, subgrp->id);
+			bgp_attr_unintern(&new_interned);
+		}
+
+		bgp_attr_flush(&attr_copy);
 	}
 
 	aspath_unintern(&aspath);
