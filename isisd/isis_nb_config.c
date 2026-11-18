@@ -1500,19 +1500,47 @@ int isis_instance_redistribute_ipv6_metric_destroy(struct nb_cb_destroy_args *ar
  */
 int isis_instance_redistribute_ipv6_table_create(struct nb_cb_create_args *args)
 {
+	// if (args->event != NB_EV_APPLY)
+	// 	return NB_OK;
+	uint16_t table;
+	int type, level;
+	unsigned long metric = 0;
+	const char *routemap = NULL;
+	struct isis_area *area;
+
 	if (args->event != NB_EV_APPLY)
 		return NB_OK;
 
-	/* TODO */
+	type = yang_dnode_get_enum(args->dnode, "../protocol");
+	level = yang_dnode_get_enum(args->dnode, "../level");
+	area = nb_running_get_entry(lyd_parent(args->dnode), NULL, true);
+
+	if (yang_dnode_exists(args->dnode, "metric"))
+		metric = yang_dnode_get_uint32(args->dnode, "metric");
+	if (yang_dnode_exists(args->dnode, "route-map"))
+		routemap = yang_dnode_get_string(args->dnode, "route-map");
+
+	table = yang_dnode_get_uint16(args->dnode, "table");
+	isis_redist_set(area, level, AF_INET6, type, metric, routemap, 0, table);
+
 	return NB_OK;
 }
 
 int isis_instance_redistribute_ipv6_table_destroy(struct nb_cb_destroy_args *args)
 {
+	struct isis_area *area;
+	int level, type;
+	uint16_t table;
+
 	if (args->event != NB_EV_APPLY)
 		return NB_OK;
 
-	/* TODO */
+	area = nb_running_get_entry(lyd_parent(args->dnode), NULL, true);
+	level = yang_dnode_get_enum(args->dnode, "../level");
+	type = yang_dnode_get_enum(args->dnode, "../protocol");
+	table = yang_dnode_get_uint16(args->dnode, "table");
+	isis_redist_unset(area, level, AF_INET6, type, table);
+
 	return NB_OK;
 }
 
