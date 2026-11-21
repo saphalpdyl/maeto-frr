@@ -111,6 +111,8 @@ enum bfddp_message_type {
 /** Authenticates sessions with the keys `DP_SESSION_AUTH` carries. */
 #define BFDDP_CAP_SESSION_AUTH (1ULL << 0)
 
+#define BFDDP_CAP_SESSION_VRF (1ULL << 2)
+
 /**
  * `ECHO_REQUEST`/`ECHO_REPLY` data payload.
  *

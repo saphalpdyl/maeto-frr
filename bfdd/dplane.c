@@ -779,6 +779,9 @@ static uint64_t bfd_dplane_session_needs(const struct bfd_session *bs)
 	if (bs->kc)
 		needs |= BFDDP_CAP_SESSION_AUTH;
 
+	if (bs->vrf && bs->vrf->vrf_id != VRF_DEFAULT)
+	  needs |= BFDDP_CAP_SESSION_VRF;
+
 	return needs;
 }
 
