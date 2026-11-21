@@ -3044,8 +3044,8 @@ void bfd_rtt_init(struct bfd_session *bfd)
 int bfd_vrf_start_sockets(struct bfd_vrf_global *bvrf)
 {
 	/* Don't open sockets when using data plane. */
-	if (bglobal.bg_use_dplane)
-		return 0;
+	// if (bglobal.bg_use_dplane)
+	// 	return 0;
 
 	if (!bfd_vrf_is_perm(bvrf->vrf->name))
 		return 0;
